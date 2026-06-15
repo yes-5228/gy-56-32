@@ -353,7 +353,12 @@ curl -s http://localhost:8000/api/health/ | python -m json.tool
 ```json
 {
     "status": "ok",
-    "service": "travel-planner"
+    "service": "travel-planner",
+    "checks": {
+        "database": "ok",
+        "migrations": "ok",
+        "demo_data": "ok"
+    }
 }
 ```
 
@@ -371,27 +376,25 @@ cursor.close()
 "
 
 # 2. 迁移状态检查
-docker compose exec backend python -c "
-from django.core.management import call_command
-from io import StringIO
-out = StringIO()
-call_command('showmigrations', stdout=out)
-pending = [l for l in out.getvalue().split('\n') if '[ ]' in l]
-if pending:
-    print(f'PENDING MIGRATIONS: {len(pending)}')
-    for p in pending:
-        print(f'  - {p.strip()}')
-else:
-    print('Migrations: ALL APPLIED')
-"
+docker compose exec backend python manage.py showmigrations
 
-# 3. 数据完整性检查（演示数据）
+# 3. 数据完整性检查（演示数据，5 类全部检查）
 docker compose exec backend python -c "
 import django
 django.setup()
 from apps.attractions.models import Attraction
-from apps.routes.models import TravelRoute
-print(f'Demo Data: attractions={Attraction.objects.count()}, routes={TravelRoute.objects.count()}')
+from apps.routes.models import TravelRoute, RouteStop
+from apps.bookings.models import Booking
+from apps.notifications.models import TravelNotice
+counts = {
+    '景点(>=4)': Attraction.objects.count(),
+    '线路(>=1)': TravelRoute.objects.count(),
+    '停靠点(>=3)': RouteStop.objects.count(),
+    '报名(>=2)': Booking.objects.count(),
+    '通知(>=2)': TravelNotice.objects.count(),
+}
+for label, cnt in counts.items():
+    print(f'  {label}: {cnt}')
 "
 
 # 4. Gunicorn worker 状态
@@ -407,32 +410,52 @@ docker compose exec frontend wget -qO- http://backend:8000/api/health/
 curl -s -o /dev/null -w "Frontend Status: %{http_code}\n" http://localhost:5173
 ```
 
-### 4.3 Docker Compose 健康检查配置建议
+### 4.3 Docker Compose 健康检查与启动顺序
 
-当前 `docker-compose.yml` 未配置 `healthcheck`。建议补充：
+编排文件 [docker-compose.yml](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/docker-compose.yml) 已配置健康检查和启动依赖：**后端健康检查通过后前端才启动**，避免前端先起来报错。
 
+**后端健康检查**（基于 Python urllib，镜像内不需要额外安装 curl）：
 ```yaml
-services:
-  backend:
-    # ... 现有配置
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+healthcheck:
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/')"]
+  interval: 5s
+  timeout: 3s
+  retries: 12
+  start_period: 15s
+```
 
-  frontend:
-    # ... 现有配置
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5173/"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
-    depends_on:
-      backend:
-        condition: service_healthy
+**前端启动依赖**（等待后端 healthy）：
+```yaml
+depends_on:
+  backend:
+    condition: service_healthy
+```
+
+**前端健康检查**（使用 alpine 自带的 wget）：
+```yaml
+healthcheck:
+  test: ["CMD", "wget", "-qO-", "http://localhost:5173/"]
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 10s
+```
+
+**启动顺序时序**：
+```
+backend 容器启动
+  ├─ 15s start_period（等待 migrate + seed_demo 执行）
+  ├─ 每 5s 探测 /api/health/（HTTP 503→重试, HTTP 200→通过）
+  └─ 连续通过后标记为 healthy
+       ↓
+frontend 容器才启动
+  └─ npm run dev → Vite 监听 5173
+```
+
+**查看健康状态**：
+```bash
+docker compose ps
+docker compose logs backend | grep -i "migrate\|seed\|gunicorn\|Starting"
 ```
 
 ### 4.4 常见问题排查
@@ -450,64 +473,54 @@ services:
 
 以下是一键诊断脚本，按顺序执行上述所有检查：
 
+项目根目录已提供可直接运行的诊断脚本 [diagnose.sh](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/diagnose.sh)，所有检查项跑完后统一给出汇总。脚本已设置可执行权限，**直接运行即可，不要从文档手动复制**。
+
+**使用方式**：
 ```bash
-#!/bin/bash
-set -e
-
-echo "========================================="
-echo "  容器构建端到端诊断工具"
-echo "========================================="
-
-# --- 1. 依赖安装检查 ---
-echo -e "\n[1/5] 检查依赖安装状态..."
-echo "--- 后端 Python 依赖 ---"
-docker compose exec backend pip list 2>/dev/null | grep -E "Django|rest|cors|gunicorn" || echo "⚠️  后端依赖检查失败"
-echo "--- 前端 Node 依赖 ---"
-docker compose exec frontend test -d node_modules/vue && echo "✓ Vue 已安装" || echo "⚠️  Vue 未找到"
-
-# --- 2. 迁移状态检查 ---
-echo -e "\n[2/5] 检查数据库迁移..."
-docker compose exec backend python manage.py showmigrations 2>/dev/null | grep -E "\[[ X]\]" || echo "⚠️  迁移检查失败"
-
-# --- 3. 演示数据检查 ---
-echo -e "\n[3/5] 检查演示数据..."
-docker compose exec backend python -c "
-import django; django.setup()
-from apps.attractions.models import Attraction
-from apps.routes.models import TravelRoute, RouteStop
-from apps.bookings.models import Booking
-from apps.notifications.models import TravelNotice
-data = {
-    'attractions': Attraction.objects.count(),
-    'routes': TravelRoute.objects.count(),
-    'stops': RouteStop.objects.count(),
-    'bookings': Booking.objects.count(),
-    'notices': TravelNotice.objects.count(),
-}
-for k, v in data.items():
-    print(f'  {k}: {v}')
-" 2>/dev/null || echo "⚠️  数据检查失败"
-
-# --- 4. 健康检查 API ---
-echo -e "\n[4/5] 检查健康检查端点..."
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/api/health/ 2>/dev/null || echo "000")
-echo "  后端健康检查 HTTP: $HTTP_CODE"
-if [ "$HTTP_CODE" = "200" ]; then
-    echo "  响应: $(curl -s http://localhost:8000/api/health/ 2>/dev/null)"
-fi
-
-FRONT_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5173/ 2>/dev/null || echo "000")
-echo "  前端页面 HTTP: $FRONT_CODE"
-
-# --- 5. 业务 API 抽查 ---
-echo -e "\n[5/5] 抽查业务 API..."
-ROUTE_COUNT=$(curl -s http://localhost:8000/api/routes/ 2>/dev/null | python -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
-echo "  线路 API 返回条数: $ROUTE_COUNT"
-
-echo -e "\n========================================="
-echo "  诊断完成"
-echo "========================================="
+cd /Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56
+./diagnose.sh
 ```
+
+**6 步检查内容**：
+
+| 步骤 | 检查维度 | 具体内容 |
+|------|----------|----------|
+| 1/6 | 容器状态 | backend/frontend 是否 running、Docker 报告的健康状态 |
+| 2/6 | 依赖安装 | 后端 4 个 Python 包是否都存在、前端 node_modules/vue 是否存在 |
+| 3/6 | 迁移状态 | 4 个 app 的迁移是否全部 `[X]`，无 pending |
+| 4/6 | 演示数据 | 5 类数据（景点/线路/停靠点/报名/通知）数量是否达标 |
+| 5/6 | 健康检查 API | 调用 `/api/health/`，检查 HTTP 200 + status=ok，并输出 checks 详情 |
+| 6/6 | 业务 API 抽查 | 调用 `/api/routes/` 和 `/api/attractions/`，检查返回条数是否达标 |
+
+**输出示例**：
+```
+=========================================
+  容器构建端到端诊断工具
+=========================================
+
+━━━ [1/6] 容器运行状态 ━━━
+  ✅ backend 容器运行中
+  ✅ frontend 容器运行中
+  ✅ backend 健康检查: healthy
+...
+━━━ [6/6] 业务 API 抽查 ━━━
+  ✅ 线路 API 返回 1 条数据
+  ✅ 景点 API 返回 4 条数据
+
+=========================================
+  诊断结果汇总
+=========================================
+  ✅ 通过: 12
+  ❌ 失败: 0
+  ⚠️  警告: 0
+
+  🎉 所有检查通过，系统运行正常！
+```
+
+**退出码**：
+- `0`：全部通过 或 仅有警告
+- `1`：存在失败项（方便 CI/脚本化判断）
+
 
 ---
 
@@ -528,7 +541,7 @@ echo "========================================="
 
 | 文件 | 作用 |
 |------|------|
-| [docker-compose.yml](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/docker-compose.yml) | 服务编排配置 |
+| [docker-compose.yml](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/docker-compose.yml) | 服务编排 + 健康检查 + 启动依赖 |
 | [backend/Dockerfile](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/backend/Dockerfile) | 后端镜像构建 + 启动命令 |
 | [backend/requirements.txt](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/backend/requirements.txt) | Python 依赖清单 |
 | [backend/travel_planner/settings.py](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/backend/travel_planner/settings.py) | Django 配置（DB/CORS/时区） |
@@ -536,3 +549,4 @@ echo "========================================="
 | [backend/apps/routes/management/commands/seed_demo.py](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/backend/apps/routes/management/commands/seed_demo.py) | 演示数据写入命令 |
 | [frontend/Dockerfile](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/frontend/Dockerfile) | 前端镜像构建 |
 | [frontend/package.json](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/frontend/package.json) | Node 依赖与脚本 |
+| [diagnose.sh](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/diagnose.sh) | 端到端诊断脚本 |
