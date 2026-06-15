@@ -44,16 +44,33 @@ def health_check(request):
     if checks.get("migrations") == "ok":
         try:
             from apps.attractions.models import Attraction
-            from apps.routes.models import TravelRoute
+            from apps.bookings.models import Booking
+            from apps.notifications.models import TravelNotice
+            from apps.routes.models import RouteStop, TravelRoute
 
-            attraction_count = Attraction.objects.count()
-            route_count = TravelRoute.objects.count()
-            if attraction_count > 0 and route_count > 0:
+            counts = {
+                "attractions": Attraction.objects.count(),
+                "routes": TravelRoute.objects.count(),
+                "stops": RouteStop.objects.count(),
+                "bookings": Booking.objects.count(),
+                "notices": TravelNotice.objects.count(),
+            }
+            expected = {
+                "attractions": 4,
+                "routes": 1,
+                "stops": 3,
+                "bookings": 2,
+                "notices": 2,
+            }
+            missing = [
+                f"{k}={counts[k]}(期望>={expected[k]})"
+                for k in expected
+                if counts[k] < expected[k]
+            ]
+            if not missing:
                 checks["demo_data"] = "ok"
             else:
-                checks["demo_data"] = (
-                    f"incomplete: attractions={attraction_count}, routes={route_count}"
-                )
+                checks["demo_data"] = "incomplete: " + ", ".join(missing)
                 all_ok = False
         except Exception as e:
             checks["demo_data"] = f"error: {e}"

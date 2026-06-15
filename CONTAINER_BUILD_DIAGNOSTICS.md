@@ -295,17 +295,45 @@ docker compose exec backend python manage.py seed_demo
 
 ### 4.1 当前健康检查实现
 
-**健康检查端点**：[travel_planner/urls.py 第 7-9 行](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/backend/travel_planner/urls.py#L7-L9)
-
-```python
-@api_view(["GET"])
-def health_check(request):
-    return Response({"status": "ok", "service": "travel-planner"})
-```
+**健康检查端点**：[travel_planner/urls.py 第 8-84 行](file:///Users/yurik/Desktop/trae_label_project/SOLO_DOG_10_2/solo_dog_10_32/gy-56/backend/travel_planner/urls.py#L8-L84)
 
 **访问路径**：`GET /api/health/`
 
-**当前局限**：仅返回静态响应，不检查数据库、迁移、依赖状态。
+**三层级联检查**：
+
+| 检查项 | 检测内容 | 通过条件 |
+|--------|----------|----------|
+| `database` | 执行 `SELECT 1` 验证数据库连通性 | 查询成功 |
+| `migrations` | 检查 5 张核心业务表是否存在 | 所有表存在：`attractions_attraction`、`routes_travelroute`、`routes_routestop`、`bookings_booking`、`notifications_travelnotice` |
+| `demo_data` | 检查 5 类演示数据数量是否达标 | attractions>=4, routes>=1, stops>=3, bookings>=2, notices>=2 |
+
+检查具有级联跳过逻辑：上一层失败则下一层标记 `skipped`，避免无效报错。
+
+**健康时响应**（HTTP 200）：
+```json
+{
+    "status": "ok",
+    "service": "travel-planner",
+    "checks": {
+        "database": "ok",
+        "migrations": "ok",
+        "demo_data": "ok"
+    }
+}
+```
+
+**不健康时响应**（HTTP 503）：
+```json
+{
+    "status": "unhealthy",
+    "service": "travel-planner",
+    "checks": {
+        "database": "ok",
+        "migrations": "missing tables: bookings_booking",
+        "demo_data": "skipped"
+    }
+}
+```
 
 ### 4.2 完整健康检查诊断流程
 
